@@ -121,6 +121,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,6 +131,8 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess (e.g. for quantization configs).
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
@@ -212,10 +215,13 @@ class BaseVllmGenerationWorker:
                 "self._init_workers_ray(placement_group)",
                 'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
             ]
+            extra_env_str = ", ".join(
+                [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+            )
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                f'ADDITIONAL_ENV_VARS = {{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", {extra_env_str}}}',
             ]
 
             need_replace = False
@@ -231,6 +237,60 @@ class BaseVllmGenerationWorker:
             # Write back the patched content
             with open(file_to_patch, "w") as f:
                 f.write(content)
+
+        def _patch_vllm_llama_eagle3_own_lm_head():
+            """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
+            try:
+                file_to_patch = _get_vllm_file("model_executor/models/llama_eagle3.py")
+            except RuntimeError:
+                logger.warning(
+                    "Could not locate llama_eagle3.py for lm_head ownership patch."
+                )
+                return
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "self.has_own_lm_head = (" in content:
+                logger.info("llama_eagle3 lm_head ownership patch already applied.")
+                return
+
+            old_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            new_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.has_own_lm_head = (\n"
+                "            self.config.draft_vocab_size != self.config.vocab_size\n"
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply llama_eagle3 lm_head ownership patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_snippet, new_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
         def _patch_vllm_hermes_tool_parser_thread_safety():
             """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
@@ -355,6 +415,7 @@ class BaseVllmGenerationWorker:
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
+        _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
@@ -444,9 +505,6 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(
-            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
-        )
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -458,12 +516,29 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif any(
+            arch in getattr(hf_config, "architectures", [])
+            for arch in (
+                "Gemma3ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
         ):
+            detected_arch = [
+                arch
+                for arch in getattr(hf_config, "architectures", [])
+                if arch
+                in (
+                    "Gemma3ForConditionalGeneration",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                )
+            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                    "NeMo-RL is forcing it to False for this architecture. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
@@ -477,7 +552,9 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=self.cfg["vllm_cfg"].get(
+                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
+            ),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -586,10 +663,7 @@ class BaseVllmGenerationWorker:
         return metrics
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
-class VllmGenerationWorker(BaseVllmGenerationWorker):
+class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -629,10 +703,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -912,7 +986,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def sleep(self):
+    def sleep(self, discard_weights: bool = False):
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -925,7 +999,17 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
-        self.llm.sleep(level=1)
+        # Clear the renderer's multimodal processor cache (sender side) so it
+        # stays in sync with the receiver cache that vLLM clears internally
+        # during sleep.  Without this, the sender thinks images are already
+        # cached on the receiver and sends data=None, causing an assertion
+        # error.  We only clear the renderer (sender) cache here — the
+        # receiver and worker-level caches are reset by sleep() internally.
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
+            self.llm.renderer.clear_mm_cache()
+        self.llm.sleep(level=2 if discard_weights else 1)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -970,3 +1054,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)  # pragma: no cover
+class VllmGenerationWorker(VllmGenerationWorkerImpl):
+    pass

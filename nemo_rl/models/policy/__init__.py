@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
 class LoRAConfigDisabled(TypedDict):
@@ -220,8 +221,8 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
-    # Force overwrite of the initial checkpoint even if it exists (default: False)
-    force_overwrite_initial_ckpt: NotRequired[bool]
+    # Force reconvert from HF even if the checkpoint already exists (default: False)
+    force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
@@ -236,10 +237,23 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
+    # gain when multiple experts are assigned per rank (num_local_experts > 1).
+    # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
+    moe_grouped_gemm: NotRequired[bool]
+    # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    moe_flex_dispatcher_backend: NotRequired[str]
+    moe_hybridep_num_sms: NotRequired[int]
+    # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
+    hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
+    # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
+    hybridep_use_mnnvl: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    gradient_accumulation_fusion: NotRequired[bool]
     # When True, uses chunked linear cross-entropy fusion loss to compute loss
     # directly from hidden states, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
@@ -249,6 +263,24 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing the fused linear CE loss.
     # Smaller values reduce peak memory further but may decrease throughput.
     linear_ce_fusion_chunk_size: NotRequired[int]
+    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
+    mtp_num_layers: NotRequired[int]
+
+
+class DraftConfigDisabled(TypedDict):
+    """Configuration shape for the disabled draft-model training path."""
+
+    enabled: Literal[False]
+
+
+class DraftConfig(TypedDict):
+    """Configuration for Eagle draft-model training alongside the policy model."""
+
+    enabled: Literal[True]
+    model_name: NotRequired[str | None]
+    loss_weight: NotRequired[float]
+    num_layers: NotRequired[int | None]
+    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):
@@ -313,6 +345,8 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
@@ -327,3 +361,10 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+
+    # quantization configs
+    quant_cfg: NotRequired[str | None]
+    quant_calib_data: NotRequired[str | None]
+    quant_calib_size: NotRequired[int | None]
+    quant_batch_size: NotRequired[int | None]
+    quant_sequence_length: NotRequired[int | None]

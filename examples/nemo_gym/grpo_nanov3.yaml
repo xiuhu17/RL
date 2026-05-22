@@ -107,6 +107,7 @@ policy:
     track_moe_metrics: True
     moe_per_layer_logging: True
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     optimizer:
       optimizer: "adam"
@@ -180,7 +181,7 @@ policy:
 
   generation:
     backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
     top_k: null

@@ -46,6 +46,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
+from nemo_rl.models.policy.utils import resolve_policy_worker_cls
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -85,13 +86,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if draft_enabled and not megatron_enable:
+            raise ValueError(
+                "policy.draft.enabled=true is only supported with the Megatron backend. "
+                "Set policy.megatron_cfg.enabled=true or disable policy.draft."
+            )
+        if draft_enabled and bool(
+            config.get("sequence_packing", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "policy.draft.enabled=true does not support sequence packing yet. "
+                "Disable policy.sequence_packing.enabled or policy.draft."
+            )
         if megatron_enable:
-            worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
+                config,
+            )
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -114,8 +131,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
-
+                worker_builder_cls_fqn = resolve_policy_worker_cls(
+                    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                    config,
+                )
                 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                     warnings.warn(
                         "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
@@ -126,7 +145,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
-                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                worker_builder_cls_fqn = resolve_policy_worker_cls(
+                    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
+                    config,
+                )
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
@@ -278,9 +300,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
-            sequence_length_pad_multiple = (
-                cp_size * 2 * tp_size if cp_size > 1 else tp_size
-            )
+            sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",

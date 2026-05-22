@@ -24,6 +24,8 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -95,6 +97,420 @@ class TestValidateModelPaths:
 
         assert hf_model_name == "test-model"
         assert pt_checkpoint_exists is True
+
+    def test_hf_config_overrides_change_hashed_pretrained_path(self, tmp_path):
+        """Test that different hf_config_overrides map to different hashed paths."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        base_config = {"model_name": "test-model"}
+        yarn_config = {
+            "model_name": "test-model",
+            "hf_config_overrides": {
+                "rope_scaling": {
+                    "rope_type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 32768,
+                }
+            },
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path / "checkpoints"),
+        ):
+            _, base_pretrained_path, base_checkpoint_exists = validate_model_paths(
+                base_config
+            )
+            _, yarn_pretrained_path, yarn_checkpoint_exists = validate_model_paths(
+                yarn_config
+            )
+
+        assert base_pretrained_path == f"{tmp_path}/checkpoints/test-model"
+        assert "__hfovr_" not in base_pretrained_path
+        assert yarn_pretrained_path.startswith(
+            f"{tmp_path}/checkpoints/test-model__hfovr_"
+        )
+        assert yarn_pretrained_path != base_pretrained_path
+        assert base_checkpoint_exists is False
+        assert yarn_checkpoint_exists is False
+
+    def test_pretrained_checkpoint_megatron_bridge_valid(self, tmp_path):
+        """megatron_bridge format: path must be an iter dir containing run_config.yaml."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        iter_dir = tmp_path / "checkpoints" / "iter_0010000"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(iter_dir),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        # pretrained_path is the iter dir itself, not the root
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_resolves_to_latest_iter(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir with iter_* subdirs resolves to the latest iter."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_old = ckpt_root / "iter_0000000"
+        iter_new = ckpt_root / "iter_0010000"
+        for d in (iter_old, iter_new):
+            d.mkdir(parents=True)
+            (d / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        # Should resolve to the latest iter dir, not the root
+        assert pretrained_path == str(iter_new)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_resolves_iteration(
+        self, tmp_path
+    ):
+        """megatron_bridge format: latest_checkpointed_iteration.txt resolves to the named iter dir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        iter_dir = ckpt_root / "iter_0007000"
+        iter_dir.mkdir()
+        (iter_dir / "run_config.yaml").touch()
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("7000")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_release_resolves(
+        self, tmp_path
+    ):
+        """megatron_bridge format: tracker containing 'release' resolves to the release/ subdir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        release_dir = ckpt_root / "release"
+        release_dir.mkdir()
+        (release_dir / "run_config.yaml").touch()
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("release")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(release_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_invalid_value_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: non-integer, non-'release' tracker content raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("not_a_number")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(ValueError, match="latest_checkpointed_iteration.txt"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_missing_run_config_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir whose iter subdir lacks run_config.yaml raises."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_dir = ckpt_root / "iter_0005000"
+        iter_dir.mkdir(parents=True)
+        # No run_config.yaml inside iter_dir
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_bridge_missing_run_config_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: raises FileNotFoundError when run_config.yaml is absent."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        # Directory exists but has no run_config.yaml and no iter_* subdirs
+        iter_dir = tmp_path / "iter_0001000"
+        iter_dir.mkdir()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(iter_dir),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_lm_returns_path_directly(self, tmp_path):
+        """megatron_lm format: root dir with iter_* subdirs resolves to the latest iter."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        iter_dir = mlm_root / "iter_0005000"
+        iter_dir.mkdir()
+        (iter_dir / "metadata.json").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_iter_dir_returns_path_directly(
+        self, tmp_path
+    ):
+        """megatron_lm format: an explicit iter dir is returned as-is, exists=True."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_iter = tmp_path / "my_mlm_ckpt" / "iter_0005000"
+        mlm_iter.mkdir(parents=True)
+        (mlm_iter / "metadata.json").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_iter),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(mlm_iter)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_tracker_file_resolves_iteration(
+        self, tmp_path
+    ):
+        """megatron_lm format: latest_checkpointed_iteration.txt resolves to the named iter dir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        iter_dir = mlm_root / "iter_0007000"
+        iter_dir.mkdir()
+        (iter_dir / "metadata.json").touch()
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("7000")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_tracker_file_release_resolves(
+        self, tmp_path
+    ):
+        """megatron_lm format: tracker containing 'release' resolves to the release/ subdir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        release_dir = mlm_root / "release"
+        release_dir.mkdir()
+        (release_dir / "metadata.json").touch()
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("release")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(release_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_tracker_file_invalid_value_raises(
+        self, tmp_path
+    ):
+        """megatron_lm format: tracker content that is not an integer or 'release' raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("not_a_number")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(ValueError, match="latest_checkpointed_iteration.txt"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_lm_no_iter_subdirs_raises(self, tmp_path):
+        """megatron_lm format: root dir with no metadata.json, tracker, or iter_* subdirs raises."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="iter_\\* subdirectories"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_lm_iter_subdir_missing_metadata_raises(
+        self, tmp_path
+    ):
+        """megatron_lm format: iter_* subdir found by scan but missing metadata.json raises."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        (mlm_root / "iter_0003000").mkdir()
+        # No metadata.json inside iter_0003000
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="metadata.json"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_lm_missing_path_raises(self, tmp_path):
+        """megatron_lm format: raises FileNotFoundError when path does not exist."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(tmp_path / "nonexistent"),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_unknown_format_raises(self, tmp_path):
+        """Unknown format raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(tmp_path),
+                "format": "some_unknown_format",
+            },
+        }
+
+        with pytest.raises(ValueError, match="Unknown pretrained_checkpoint format"):
+            validate_model_paths(config)
 
 
 @pytest.mark.mcore
@@ -204,6 +620,216 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @staticmethod
+    def _base_moe_megatron_cfg() -> dict:
+        return {
+            "expert_tensor_parallel_size": 2,
+            "expert_model_parallel_size": 4,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": True,
+        }
+
+    @staticmethod
+    def _base_moe_cfg(**overrides):
+        cfg = {
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 8,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_shared_expert_overlap": True,
+        }
+        cfg.update(overrides)
+        return {"megatron_cfg": cfg}
+
+    @pytest.mark.parametrize("moe_grouped_gemm", [True, False])
+    def test_moe_grouped_gemm_explicit(self, moe_grouped_gemm):
+        """moe_grouped_gemm is applied when present in config."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_grouped_gemm"] = moe_grouped_gemm
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
+
+    def test_moe_grouped_gemm_absent_keeps_default(self):
+        """Absent key leaves the attr unset on the model cfg."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        # spec lists everything _apply_moe_config writes so we can detect
+        # whether the moe_grouped_gemm branch fires.
+        model_cfg = MagicMock(
+            spec=[
+                "expert_tensor_parallel_size",
+                "expert_model_parallel_size",
+                "moe_router_dtype",
+                "moe_router_load_balancing_type",
+                "moe_router_bias_update_rate",
+                "moe_permute_fusion",
+                "moe_enable_deepep",
+                "moe_token_dispatcher_type",
+                "moe_shared_expert_overlap",
+            ]
+        )
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_grouped_gemm")
+
+    def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
+        """HybridEP backend with no env config: auto-set env vars and emit warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with pytest.warns(UserWarning) as warn_records:
+            _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
+        assert model_cfg.moe_hybridep_num_sms == 32
+        # min(ep_size=8, 64) == 8
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
+        # int(ep_size=8 > 4) == 1
+        assert os.environ["USE_MNNVL"] == "1"
+        warn_messages = [str(w.message) for w in warn_records]
+        assert any(
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured" in m
+            for m in warn_messages
+        )
+        assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
+        """Explicit hybridep_* config keys override defaults without warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=128,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=24,
+            hybridep_num_ranks_per_nvlink_domain=72,
+            hybridep_use_mnnvl=True,
+        )
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "72"
+        assert os.environ["USE_MNNVL"] == "1"
+        # Bool False path also tested in dedicated test below; here ensure no auto warning fired.
+        hybridep_warns = [w for w in caught if "HybridEP" in str(w.message)]
+        assert hybridep_warns == []
+
+    def test_hybridep_use_mnnvl_explicit_false(self, monkeypatch):
+        """hybridep_use_mnnvl=False → USE_MNNVL='0'."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_flex_dispatcher_backend="hybridep",
+            hybridep_num_ranks_per_nvlink_domain=4,
+            hybridep_use_mnnvl=False,
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["USE_MNNVL"] == "0"
+
+    def test_hybridep_preserves_preexisting_env(self, monkeypatch):
+        """Pre-existing env vars must not be overwritten when config is absent."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "16")
+        monkeypatch.setenv("USE_MNNVL", "1")
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=64,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "16"
+        assert os.environ["USE_MNNVL"] == "1"
+
+    def test_hybridep_skipped_when_backend_not_hybridep(self, monkeypatch):
+        """Non-hybridep backend leaves env vars untouched and skips num_sms gate."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        # backend present but not "hybridep"
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "alltoall"
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
+
+    def test_hybridep_keys_absent_no_setattr(self, monkeypatch):
+        """When neither moe_flex_dispatcher_backend nor moe_hybridep_num_sms is in cfg,
+        the corresponding model_cfg attributes must not be set."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        # Use a SimpleNamespace-like object (not MagicMock) so we can detect
+        # missing attribute access cleanly.
+        class _Cfg:
+            expert_model_parallel_size = 4
+
+        model_cfg = _Cfg()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_token_dispatcher_type="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_backend")
+        assert not hasattr(model_cfg, "moe_hybridep_num_sms")
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
+
 
 @pytest.mark.mcore
 class TestApplyPrecisionConfig:
@@ -276,6 +902,7 @@ class TestApplyPerformanceConfig:
                 "activation_checkpointing": False,
                 "apply_rope_fusion": True,
                 "bias_activation_fusion": True,
+                "gradient_accumulation_fusion": False,
             }
         }
 
@@ -296,6 +923,7 @@ class TestApplyPerformanceConfig:
                 "activation_checkpointing": True,
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
             }
         }
 
@@ -317,6 +945,7 @@ class TestApplyPerformanceConfig:
                 "activation_checkpointing": False,
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
             }
         }
 
@@ -336,6 +965,7 @@ class TestApplyPerformanceConfig:
                 "activation_checkpointing": False,
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -362,6 +992,7 @@ class TestApplyPerformanceConfig:
                 "activation_checkpointing": False,
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -856,6 +1487,174 @@ class TestModelAndOptimizerStateNamedTuple:
 
 
 @pytest.mark.mcore
+class TestSetupModelConfig:
+    """Tests for setup_model_config — hf_config_overrides handling."""
+
+    _HELPER_PATCHES = [
+        "nemo_rl.models.megatron.setup._create_megatron_config",
+        "nemo_rl.models.megatron.setup._validate_training_config",
+        "nemo_rl.models.megatron.setup._create_checkpoint_config",
+        "nemo_rl.models.megatron.setup._validate_chunking_config",
+        "nemo_rl.models.megatron.setup._validate_optimizer_config",
+        "nemo_rl.models.megatron.setup._validate_dtype_config",
+        "nemo_rl.models.megatron.setup._apply_performance_config",
+        "nemo_rl.models.megatron.setup._apply_precision_config",
+        "nemo_rl.models.megatron.setup._apply_mtp_config",
+        "nemo_rl.models.megatron.setup._apply_moe_config",
+        "nemo_rl.models.megatron.setup._apply_parallelism_config",
+    ]
+
+    def _apply_patches(self, request):
+        """Apply all helper patches and return a dict of mocks."""
+        mocks = {}
+        for target in self._HELPER_PATCHES:
+            name = target.rsplit(".", 1)[-1]
+            p = patch(target)
+            mocks[name] = p.start()
+            request.addfinalizer(p.stop)
+        return mocks
+
+    def test_megatron_lm_passes_hf_config_overrides_to_autoconfig(self, request):
+        """hf_config_overrides must be forwarded to AutoConfig.from_pretrained for megatron_lm."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        mock_model_cfg = MagicMock()
+        mock_provider = MagicMock()
+        mock_provider.to_megatron_provider.return_value = mock_model_cfg
+
+        overrides = {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "hf_config_overrides": overrides,
+            "megatron_cfg": {},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained") as mock_ac,
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_ab,
+        ):
+            mock_ab.from_hf_config.return_value = mock_provider
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
+        mock_ac.assert_called_once_with(
+            "test-model",
+            trust_remote_code=True,
+            rope_scaling={"rope_type": "yarn", "factor": 4.0},
+        )
+
+    def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
+        self, request
+    ):
+        """When hf_config_overrides is absent, AutoConfig.from_pretrained gets no extra kwargs."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        mock_provider = MagicMock()
+        mock_provider.to_megatron_provider.return_value = MagicMock()
+
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained") as mock_ac,
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_ab,
+        ):
+            mock_ab.from_hf_config.return_value = mock_provider
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
+        mock_ac.assert_called_once_with("test-model", trust_remote_code=True)
+
+    def test_megatron_bridge_with_hf_config_overrides_warns(self, tmp_path, request):
+        """hf_config_overrides set with megatron_bridge format must emit a UserWarning."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        # Create a minimal run_config.yaml so the filesystem check passes.
+        (tmp_path / "run_config.yaml").touch()
+
+        config = {
+            "pretrained_checkpoint": {
+                "format": "megatron_bridge",
+                "path": str(tmp_path),
+            },
+            "hf_config_overrides": {
+                "rope_scaling": {"rope_type": "yarn", "factor": 4.0}
+            },
+            "megatron_cfg": {},
+        }
+
+        mock_cfg = MagicMock()
+        mock_cfg.model = MagicMock()
+
+        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
+            mock_cc.from_yaml.return_value = mock_cfg
+            with pytest.warns(
+                UserWarning, match="hf_config_overrides is set but will be ignored"
+            ):
+                setup_model_config(
+                    config,
+                    rank=0,
+                    dtype=torch.bfloat16,
+                    hf_model_name="test-model",
+                    pretrained_path=str(tmp_path),
+                )
+
+    def test_megatron_bridge_without_hf_config_overrides_no_warning(
+        self, tmp_path, request
+    ):
+        """No warning when hf_config_overrides is absent for megatron_bridge format."""
+        import warnings as _warnings
+
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        (tmp_path / "run_config.yaml").touch()
+
+        config = {
+            "pretrained_checkpoint": {
+                "format": "megatron_bridge",
+                "path": str(tmp_path),
+            },
+            "megatron_cfg": {},
+        }
+
+        mock_cfg = MagicMock()
+        mock_cfg.model = MagicMock()
+
+        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
+            mock_cc.from_yaml.return_value = mock_cfg
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error", UserWarning)
+                # Should not raise
+                setup_model_config(
+                    config,
+                    rank=0,
+                    dtype=torch.bfloat16,
+                    hf_model_name="test-model",
+                    pretrained_path=str(tmp_path),
+                )
+
+
+@pytest.mark.mcore
 class TestHandleModelImport:
     """Tests for handle_model_import function."""
 
@@ -896,6 +1695,8 @@ class TestHandleModelImport:
             "test-model",
             pretrained_path,
             {"some_config": "value"},
+            model_post_wrap_hook=None,
+            transformer_layer_spec=None,
         )
 
     @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
@@ -923,6 +1724,49 @@ class TestHandleModelImport:
 
         captured = capsys.readouterr()
         assert "Reinitializing model parallel" in captured.out
+
+    @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
+    @patch("nemo_rl.models.megatron.setup.parallel_state")
+    def test_force_reconvert_from_hf_when_checkpoint_exists(
+        self, mock_ps, mock_import, tmp_path
+    ):
+        """Test that force_reconvert_from_hf forces reimport even when checkpoint exists."""
+        from nemo_rl.models.megatron.setup import handle_model_import
+
+        mock_ps.model_parallel_is_initialized.return_value = False
+
+        pretrained_path = str(tmp_path / "model")
+        print(f"pretrained_path: {pretrained_path}")
+        yarn_overrides = {
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            }
+        }
+        config = {
+            "model_name": "test-model",
+            "megatron_cfg": {"force_reconvert_from_hf": True},
+            "hf_config_overrides": yarn_overrides,
+        }
+
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=True
+        )
+
+        mock_import.assert_called_once_with(
+            "test-model",
+            pretrained_path,
+            {"force_reconvert_from_hf": True},
+            model_post_wrap_hook=None,
+            transformer_layer_spec=None,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        )
+        mock_ps.destroy_model_parallel.assert_not_called()
 
 
 @pytest.mark.mcore
@@ -1151,4 +1995,200 @@ class TestFinalizeMegatronSetup:
         mock_build_tokenizer.assert_called_once()
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
+        )
+
+
+@pytest.mark.mcore
+class TestDraftSetup:
+    """Tests for Eagle draft-model setup utilities."""
+
+    @staticmethod
+    def _build_model_provider():
+        return SimpleNamespace(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            use_cpu_initialization=True,
+            fp16=False,
+            bf16=False,
+            params_dtype=torch.float32,
+            pipeline_dtype=torch.float32,
+            ffn_hidden_size=16,
+            num_attention_heads=2,
+            kv_channels=4,
+            num_query_groups=2,
+            init_method_std=0.02,
+            layernorm_epsilon=1e-5,
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_size=8,
+            vocab_size=8,
+            seq_length=16,
+            position_embedding_type="rope",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=None,
+            rope_scaling_factor=None,
+            num_layers=4,
+        )
+
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    def test_draft_pre_wrap_hook_attaches_only_owner_chunk(
+        self, mock_build_draft_model, mock_get_pg_collection
+    ):
+        """The nested draft model should attach only to the owner post-process chunk."""
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self, *, post_process: bool = False):
+                super().__init__()
+                self.post_process = post_process
+
+        chunks = [
+            DummyChunk(post_process=False),
+            DummyChunk(post_process=True),
+            DummyChunk(post_process=False),
+        ]
+        draft_model = torch.nn.Linear(2, 2, bias=False)
+        mock_build_draft_model.return_value = draft_model
+        mock_get_pg_collection.return_value = MagicMock()
+
+        hook = _create_draft_pre_wrap_hook(
+            policy_cfg={"draft": {"enabled": True, "model_name": None}},
+            megatron_cfg=MagicMock(),
+            state=MagicMock(),
+            preload_policy_from_pretrained=False,
+        )
+
+        returned_model = hook(chunks)
+
+        assert returned_model is chunks
+        assert getattr(chunks[0], "draft_model", None) is None
+        assert chunks[1].draft_model is draft_model
+        assert getattr(chunks[2], "draft_model", None) is None
+        mock_build_draft_model.assert_called_once()
+        assert (
+            mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
+        )
+
+    @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
+    @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
+    @patch("nemo_rl.models.megatron.draft.eagle.EagleModel")
+    @patch("transformers.AutoConfig.from_pretrained")
+    def test_build_draft_model_falls_back_to_policy_lm_head(
+        self,
+        mock_auto_config,
+        mock_eagle_model,
+        mock_load_hf_weights,
+        mock_copy_lm_head,
+    ):
+        """Missing draft LM-head weights should fall back to the policy LM head."""
+        from nemo_rl.models.megatron.setup import build_draft_model
+
+        mock_auto_config.return_value.to_dict.return_value = {
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "attention_dropout": 0.0,
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "eagle_aux_hidden_state_layer_ids": [0, 2],
+        }
+        draft_model = MagicMock()
+        draft_model.modules.return_value = []
+        mock_eagle_model.return_value = draft_model
+        mock_load_hf_weights.return_value = (
+            ["eagle_module.eagle_output_layer.weight"],
+            [],
+        )
+        policy_model_chunk = MagicMock()
+
+        returned_model = build_draft_model(
+            model_provider=self._build_model_provider(),
+            draft_config={"enabled": True, "model_name": "dummy-draft"},
+            pg_collection=SimpleNamespace(tp=None),
+            policy_model_chunk=policy_model_chunk,
+        )
+
+        assert returned_model is draft_model
+        mock_copy_lm_head.assert_called_once_with(
+            draft_model=draft_model,
+            policy_model_chunk=policy_model_chunk,
+        )
+
+    @patch("nemo_rl.models.megatron.draft.utils.unwrap_model")
+    def test_copy_policy_lm_head_to_draft_raises_on_shape_mismatch(
+        self, mock_unwrap_model
+    ):
+        """Selected policy rows must match the draft LM-head shard shape."""
+        from nemo_rl.models.megatron.draft.utils import copy_policy_lm_head_to_draft
+
+        policy_model = SimpleNamespace(
+            share_embeddings_and_output_weights=False,
+            output_layer=SimpleNamespace(weight=torch.randn(2, 4)),
+        )
+        mock_unwrap_model.return_value = policy_model
+        draft_model = SimpleNamespace(
+            config=SimpleNamespace(draft_vocab_size=2),
+            eagle_module=SimpleNamespace(
+                eagle_output_layer=SimpleNamespace(weight=torch.zeros(3, 4)),
+                d2t=None,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="local shard shapes differ"):
+            copy_policy_lm_head_to_draft(
+                draft_model=draft_model,
+                policy_model_chunk=MagicMock(),
+            )
+
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    def test_attached_draft_state_is_serializable(
+        self, mock_build_draft_model, mock_get_pg_collection
+    ):
+        """Attached draft modules should be part of the owner chunk state_dict."""
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.post_process = True
+                self.base = torch.nn.Linear(2, 2, bias=False)
+
+        mock_get_pg_collection.return_value = MagicMock()
+
+        def attach_fresh_draft():
+            chunk = DummyChunk()
+            hook = _create_draft_pre_wrap_hook(
+                policy_cfg={"draft": {"enabled": True, "model_name": None}},
+                megatron_cfg=MagicMock(),
+                state=MagicMock(),
+                preload_policy_from_pretrained=False,
+            )
+            hook([chunk])
+            return chunk
+
+        original_draft = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            original_draft.weight.fill_(3.14)
+        mock_build_draft_model.return_value = original_draft
+        owner_chunk = attach_fresh_draft()
+        state_dict = owner_chunk.state_dict()
+
+        assert "draft_model.weight" in state_dict
+
+        restored_draft = torch.nn.Linear(2, 2, bias=False)
+        mock_build_draft_model.return_value = restored_draft
+        restored_chunk = attach_fresh_draft()
+        restored_chunk.load_state_dict(state_dict)
+
+        torch.testing.assert_close(
+            restored_chunk.draft_model.weight,
+            owner_chunk.draft_model.weight,
         )

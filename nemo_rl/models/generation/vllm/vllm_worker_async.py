@@ -144,10 +144,7 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
-)  # pragma: no cover
-class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -1132,7 +1129,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def sleep_async(self):
+    async def sleep_async(self, discard_weights: bool = False):
         """Async version of sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1145,7 +1142,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
-        await self.llm.sleep(level=1)
+        # Reset the multimodal processor cache (sender side) so it stays in
+        # sync with the receiver cache that vLLM clears internally during
+        # sleep.  Without this, the sender thinks images are already cached on
+        # the receiver and sends data=None, causing an assertion error.
+        if hasattr(self.llm, "reset_mm_cache"):
+            await self.llm.reset_mm_cache()
+        await self.llm.sleep(level=2 if discard_weights else 1)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1205,3 +1208,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
+)  # pragma: no cover
+class VllmAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
+    pass

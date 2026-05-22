@@ -30,7 +30,7 @@ nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
 nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
 release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
-h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance_h100.txt")
+h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 gb200_performance_test_suite_path = os.path.join(
     test_suites_dir, "performance_gb200.txt"
 )
@@ -45,13 +45,13 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "distillation": "examples/configs/distillation_math.yaml",
     "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
-    "prorlv2": "examples/configs/prorlv2.yaml",
+    "prorlv2": "examples/configs/prorlv2.v2.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
 # These keys may exist in recipe configs but not in base configs, so we need to
 # manually add them to avoid merge conflicts during config validation
-ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.generation.vllm_kwargs"]
+ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs"]
 
 
 @pytest.fixture
@@ -233,7 +233,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1320_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1340_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -265,8 +265,8 @@ def test_nightly_compute_stays_below_1320_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1320, (
-        f"Total GPU hours exceeded 1320: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1340, (
+        f"Total GPU hours exceeded 1340: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 

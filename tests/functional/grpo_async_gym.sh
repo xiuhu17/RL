@@ -37,10 +37,7 @@ if [[ ! -f env.yaml ]]; then
     echo "hf_token: $HF_TOKEN" >> env.yaml
 fi
 
-config_paths="responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,\
-resources_servers/workplace_assistant/configs/workplace_assistant.yaml"
-
-uv run ng_prepare_data "+config_paths=[${config_paths}]" \
+uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
     +output_dirpath=data/workplace_assistant \
     +mode=train_preparation \
     +should_download=true \
@@ -69,6 +66,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
     policy.max_total_sequence_length=512 \
+    policy.generation.max_new_tokens=128 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
     policy.generation.colocated.resources.gpus_per_node=1 \
