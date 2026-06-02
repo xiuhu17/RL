@@ -99,6 +99,8 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
+    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
     activation_checkpointing: bool
@@ -204,6 +206,16 @@ class MegatronConfig(TypedDict):
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
     activation_checkpointing: bool
+    # Recompute granularity: "full" recomputes all activations, "selective" recomputes
+    # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
+    # for MoE models while retaining higher throughput than "full".
+    recompute_granularity: NotRequired[Literal["full", "selective"]]
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore valid options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Defaults to ["core_attn"] when None. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # when None. Use ["moe"] to recompute only expert activations (production-proven config).
+    recompute_modules: NotRequired[list[str] | None]
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
