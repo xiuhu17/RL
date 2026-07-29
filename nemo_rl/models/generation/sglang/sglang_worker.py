@@ -377,23 +377,13 @@ class SGLangGenerationWorker:
         response.raise_for_status()
         return response
 
-    def post_process_weights(
-        self,
-        restore_weights_before_load: bool = False,
-        post_process_quantization: bool = False,
-    ):
-        """Finalize engine-side weights after a distributed/IPC refit.
+    def begin_weight_update(self):
+        """Open one engine-side session before the first refit bucket."""
+        return self._make_request("begin_weight_update", {})
 
-        The HTTP server only posts metadata; the real weights were already
-        copied on-GPU by the preceding update path.
-        """
-        return self._make_request(
-            "post_process_weights",
-            {
-                "restore_weights_before_load": restore_weights_before_load,
-                "post_process_quantization": post_process_quantization,
-            },
-        )
+    def end_weight_update(self):
+        """Finalize quantized layouts after the last refit bucket."""
+        return self._make_request("end_weight_update", {})
 
     def _simulate_crash(self):
         """Test-only: tear the engine down to simulate a crash.

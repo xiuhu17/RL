@@ -2177,6 +2177,17 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
             MegatronSGLangHfWeightIterator,
         )
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            get_sglang_quantization_scheme,
+        )
+
+        configured_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
+        if target_precision != configured_precision:
+            raise ValueError(
+                "SGLang refit target precision does not match its quantization "
+                f"config: target={target_precision!r}, "
+                f"configured={configured_precision!r}."
+            )
 
         if self.refit_conversion_tasks is None:
             self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
@@ -2184,7 +2195,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         num_hidden_layers = 0
-        if target_precision == "mxfp8":
+        if target_precision in ("mxfp8", "nvfp4"):
             num_hidden_layers = int(
                 getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
             )
@@ -3395,8 +3406,3 @@ class MegatronPolicyWorkerImpl(
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
-
-
-# ---------------------------------------------------------------------------
-# Driver-side SGLang weight-update dispatch (Megatron backend)
-# ---------------------------------------------------------------------------

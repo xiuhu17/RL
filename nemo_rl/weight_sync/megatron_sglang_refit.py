@@ -34,16 +34,19 @@ def refit_sglang_colocated(
     """Refit colocated SGLang engines from the Megatron policy.
 
     Lifecycle: optional fault-tolerance recover, connect (when new /
-    recovered engines), pause + flush, send HF tensor buckets via Ray
-    IPC, post-process, continue.
+    recovered engines), pause, open an engine-side update session, send HF
+    tensor buckets via Ray IPC, close the session, continue.
     """
+    from nemo_rl.models.generation.sglang.quantization_utils import (
+        get_sglang_quantization_scheme,
+    )
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
-    target_precision = sglang_quant.get("scheme", "bf16")
+    target_precision = get_sglang_quantization_scheme(sglang_quant)
 
     (
         rollout_engines,
@@ -63,10 +66,16 @@ def refit_sglang_colocated(
             "clear_updatable_num_new_engines did not zero num_new_engines"
         )
 
-    # Pause with the configured mode, then flush: an IPC refit replaces every
-    # weight in place, so no cached KV entry survives it regardless of mode.
-    policy_generation.pause_generation(mode=policy_generation.pause_generation_mode)
-    policy_generation.invalidate_kv_cache()
+    # Pause with the configured mode, but only invalidate the KV cache when
+    # the mode actually drops generation state. "in_place" leaves the engine
+    # paused without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
+    pause_mode = policy_generation.pause_generation_mode
+    policy_generation.pause_generation(mode=pause_mode)
+    if pause_mode != "in_place":
+        policy_generation.invalidate_kv_cache()
+
+    policy_generation.begin_weight_update()
     try:
         # Per-worker actor method is now synchronous (per-chunk ray.get +
         # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
@@ -79,8 +88,10 @@ def refit_sglang_colocated(
             sglang_quantization_cfg=sglang_quant,
         )
         ray.get(futures)
-        policy_generation.post_process_weights()
     finally:
+        # Close the session and resume on every path, so a failed refit
+        # leaves the engine usable instead of wedged in the update state.
+        policy_generation.end_weight_update()
         policy_generation.continue_generation()
     return True
 
@@ -97,13 +108,16 @@ def refit_sglang_distributed(
     walk the AutoBridge collective inside ``update_weights_to_sglang_distributed``
     but do not broadcast. Includes optional fault-tolerance recover prelude.
     """
+    from nemo_rl.models.generation.sglang.quantization_utils import (
+        get_sglang_quantization_scheme,
+    )
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
-    target_precision = sglang_quant.get("scheme", "bf16")
+    target_precision = get_sglang_quantization_scheme(sglang_quant)
 
     (
         rollout_engines,
@@ -131,6 +145,8 @@ def refit_sglang_distributed(
     policy_generation.pause_generation(mode=pause_mode)
     if pause_mode != "in_place":
         policy_generation.invalidate_kv_cache()
+
+    policy_generation.begin_weight_update()
     try:
         futures = policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
@@ -140,7 +156,7 @@ def refit_sglang_distributed(
             sglang_quantization_cfg=sglang_quant,
         )
         ray.get(futures)
-        policy_generation.post_process_weights()
     finally:
+        policy_generation.end_weight_update()
         policy_generation.continue_generation()
     return True

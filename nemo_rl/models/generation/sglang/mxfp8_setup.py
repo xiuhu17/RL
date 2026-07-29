@@ -46,10 +46,16 @@ from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     source_fp8_to_mxfp8_scale_u8,
     strip_weight_suffix,
 )
+from nemo_rl.models.generation.sglang.quantization_utils import (
+    build_dynamic_skip_substrings,
+    expand_sglang_atomic_high_precision_substrings,
+    get_dynamic_high_precision_substrings,
+    validate_checkpoint_high_precision_layout,
+)
 
 logger = logging.getLogger(__name__)
 
-CONVERTER_VERSION: str = "1"
+CONVERTER_VERSION: str = "4"
 
 
 class _ConversionResult:
@@ -112,6 +118,7 @@ def _load_source_scale_u8(
             scale_u8 = None
         return scale_fp32, scale_u8, scale_key
 
+    assert scale_u8 is not None
     n, k = weight.shape[-2], weight.shape[-1]
     n_tiles = (n + SOURCE_FP8_BLOCK_SIZE[0] - 1) // SOURCE_FP8_BLOCK_SIZE[0]
     k_tiles = (k + SOURCE_FP8_BLOCK_SIZE[1] - 1) // SOURCE_FP8_BLOCK_SIZE[1]
@@ -127,11 +134,8 @@ def _process_file(
     *,
     result_collector: _ConversionResult,
     device: str,
-    num_hidden_layers: int,
-    num_layers_at_start_in_bf16: int,
-    num_layers_at_end_in_bf16: int,
     source_is_block_fp8_ue8m0: bool,
-    extra_high_precision_layers_hf: tuple[str, ...],
+    skip_weight_substrings: tuple[str, ...],
     source_scale_index: dict[str, str],
 ) -> None:
     import safetensors
@@ -148,24 +152,6 @@ def _process_file(
             weights[key] = f.get_tensor(key)
 
     modules_to_not_convert: list[str] = []
-    head_end_idx = num_layers_at_start_in_bf16
-    tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16
-    dynamic_skip_layer_prefixes: set[str] = set()
-    dynamic_skip_layer_prefixes.update(
-        f"model.layers.{i}." for i in range(0, head_end_idx)
-    )
-    dynamic_skip_layer_prefixes.update(
-        f"model.layers.{i}." for i in range(tail_start_idx, num_hidden_layers)
-    )
-
-    if num_layers_at_end_in_bf16 > 0 or num_layers_at_start_in_bf16 > 0:
-        modules_to_not_convert.extend(sorted(dynamic_skip_layer_prefixes))
-
-    dynamic_skip_substrings = (
-        *SKIP_WEIGHT_SUBSTRINGS,
-        *extra_high_precision_layers_hf,
-        *sorted(dynamic_skip_layer_prefixes),
-    )
 
     for key, tensor in weights.items():
         if not key.endswith(".weight"):
@@ -174,7 +160,7 @@ def _process_file(
         should_quant = should_quantize(
             key,
             tensor,
-            skip_weight_substrings=dynamic_skip_substrings,
+            skip_weight_substrings=skip_weight_substrings,
             allow_source_fp8=source_is_block_fp8_ue8m0,
         )
 
@@ -251,6 +237,7 @@ def convert_mxfp8(
     num_layers_at_start_in_bf16: int = 0,
     num_layers_at_end_in_bf16: int = 0,
     extra_high_precision_layers_hf: tuple[str, ...] = (),
+    modules_to_not_convert: tuple[str, ...] = (),
 ) -> None:
     """Convert an HF safetensors checkpoint to MXFP8 with UE8M0 scales.
 
@@ -265,7 +252,22 @@ def convert_mxfp8(
     config_path = os.path.join(input_path, "config.json")
     with open(config_path) as f:
         cfg = json.load(f)
-    num_hidden_layers = int(cfg["num_hidden_layers"])
+    num_hidden_layers = _get_num_hidden_layers(cfg, config_path=config_path)
+    selection_config = {
+        "extra_high_precision_layers_hf": extra_high_precision_layers_hf,
+        "modules_to_not_convert": modules_to_not_convert,
+        "num_layers_at_start_in_bf16": num_layers_at_start_in_bf16,
+        "num_layers_at_end_in_bf16": num_layers_at_end_in_bf16,
+    }
+    configured_high_precision_substrings = get_dynamic_high_precision_substrings(
+        quantization_config=selection_config,
+        num_hidden_layers=num_hidden_layers,
+    )
+    skip_weight_substrings = build_dynamic_skip_substrings(
+        quantization_config=selection_config,
+        num_hidden_layers=num_hidden_layers,
+        static_skip_substrings=SKIP_WEIGHT_SUBSTRINGS,
+    )
     if is_source_block_fp8_ue8m0_checkpoint(cfg):
         source_is_block_fp8_ue8m0 = True
     elif is_bf16_source_checkpoint(cfg):
@@ -289,6 +291,16 @@ def convert_mxfp8(
     index_path = os.path.join(input_path, "model.safetensors.index.json")
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
+    expanded_skip_weight_substrings = expand_sglang_atomic_high_precision_substrings(
+        weight_names=weight_map,
+        skip_weight_substrings=skip_weight_substrings,
+    )
+    concrete_atomic_modules = tuple(
+        substring
+        for substring in expanded_skip_weight_substrings
+        if substring not in skip_weight_substrings
+    )
+    skip_weight_substrings = expanded_skip_weight_substrings
     safetensors_files = sorted(set(weight_map.values()))
     source_scale_index: dict[str, str] = {}
     if source_is_block_fp8_ue8m0:
@@ -299,6 +311,9 @@ def convert_mxfp8(
         }
 
     result_collector = _ConversionResult()
+    result_collector.modules_to_not_convert.extend(
+        (*configured_high_precision_substrings, *concrete_atomic_modules)
+    )
     for filename in safetensors_files:
         logger.info(f"[mxfp8] Processing {filename}")
         _process_file(
@@ -307,11 +322,8 @@ def convert_mxfp8(
             filename,
             result_collector=result_collector,
             device=device,
-            num_hidden_layers=num_hidden_layers,
-            num_layers_at_start_in_bf16=num_layers_at_start_in_bf16,
-            num_layers_at_end_in_bf16=num_layers_at_end_in_bf16,
             source_is_block_fp8_ue8m0=source_is_block_fp8_ue8m0,
-            extra_high_precision_layers_hf=extra_high_precision_layers_hf,
+            skip_weight_substrings=skip_weight_substrings,
             source_scale_index=source_scale_index,
         )
         gc.collect()
@@ -350,12 +362,151 @@ def _read_source_config(model_dir: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def _checkpoint_weight_names(model_dir: str) -> tuple[str, ...]:
+    """Read tensor names from an indexed or single-file safetensors checkpoint."""
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path) as file:
+            index = json.load(file)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Missing non-empty weight_map in {index_path}.")
+        if any(
+            not isinstance(name, str) or not isinstance(filename, str)
+            for name, filename in weight_map.items()
+        ):
+            raise ValueError(f"{index_path} weight_map must map strings to strings.")
+        return tuple(weight_map)
+
+    import safetensors
+
+    names: set[str] = set()
+    shard_names = sorted(
+        filename
+        for filename in os.listdir(model_dir)
+        if filename.endswith(".safetensors")
+        and os.path.isfile(os.path.join(model_dir, filename))
+    )
+    if not shard_names:
+        raise ValueError(f"No safetensors weights found in {model_dir}.")
+    for filename in shard_names:
+        with safetensors.safe_open(
+            os.path.join(model_dir, filename),
+            framework="pt",
+            device="cpu",
+        ) as file:
+            for name in file.keys():
+                if name in names:
+                    raise ValueError(
+                        f"Duplicate tensor {name!r} in checkpoint {model_dir!r}."
+                    )
+                names.add(name)
+    return tuple(names)
+
+
+def _get_num_hidden_layers(cfg: dict[str, Any], *, config_path: str) -> int:
+    num_hidden_layers = cfg.get("num_hidden_layers")
+    text_config = cfg.get("text_config")
+    if num_hidden_layers is None and isinstance(text_config, dict):
+        num_hidden_layers = text_config.get("num_hidden_layers")
+    if (
+        isinstance(num_hidden_layers, bool)
+        or not isinstance(num_hidden_layers, int)
+        or num_hidden_layers <= 0
+    ):
+        raise ValueError(
+            f"{config_path} must define a positive integer num_hidden_layers."
+        )
+    return num_hidden_layers
+
+
+def _validated_conversion_options(
+    quantization_cfg: dict[str, Any],
+    *,
+    num_hidden_layers: int,
+) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
+    """Validate and normalize the shared offline/online selection options."""
+    get_dynamic_high_precision_substrings(
+        quantization_config=quantization_cfg,
+        num_hidden_layers=num_hidden_layers,
+    )
+
+    extra_value = quantization_cfg.get("extra_high_precision_layers_hf")
+    modules_value = quantization_cfg.get("modules_to_not_convert")
+    start_value = quantization_cfg.get("num_layers_at_start_in_bf16")
+    end_value = quantization_cfg.get("num_layers_at_end_in_bf16")
+    return (
+        () if extra_value is None else tuple(item.strip() for item in extra_value),
+        () if modules_value is None else tuple(item.strip() for item in modules_value),
+        0 if start_value is None else start_value,
+        0 if end_value is None else end_value,
+    )
+
+
+def _merge_checkpoint_modules_to_not_convert(
+    *,
+    checkpoint_path: str,
+    quantization_cfg: dict[str, Any],
+) -> None:
+    """Merge the checkpoint's concrete ignore list into the refit config."""
+    checkpoint_cfg = _read_source_config(checkpoint_path)
+    checkpoint_quantization_cfg = checkpoint_cfg.get("quantization_config")
+    if not isinstance(checkpoint_quantization_cfg, dict):
+        raise ValueError(f"{checkpoint_path}/config.json has no quantization_config.")
+
+    num_hidden_layers = _get_num_hidden_layers(
+        checkpoint_cfg,
+        config_path=os.path.join(checkpoint_path, "config.json"),
+    )
+    _, user_modules, _, _ = _validated_conversion_options(
+        quantization_cfg,
+        num_hidden_layers=num_hidden_layers,
+    )
+    requested_high_precision = get_dynamic_high_precision_substrings(
+        quantization_config=quantization_cfg,
+        num_hidden_layers=num_hidden_layers,
+    )
+    checkpoint_modules = get_dynamic_high_precision_substrings(
+        quantization_config={
+            "modules_to_not_convert": checkpoint_quantization_cfg.get(
+                "modules_to_not_convert"
+            )
+        },
+        num_hidden_layers=num_hidden_layers,
+    )
+    checkpoint_weight_names = _checkpoint_weight_names(checkpoint_path)
+    configured_high_precision = tuple(
+        dict.fromkeys((*requested_high_precision, *checkpoint_modules))
+    )
+    expanded_high_precision = expand_sglang_atomic_high_precision_substrings(
+        weight_names=checkpoint_weight_names,
+        skip_weight_substrings=configured_high_precision,
+    )
+    validate_checkpoint_high_precision_layout(
+        checkpoint_path=checkpoint_path,
+        scheme="MXFP8",
+        weight_names=checkpoint_weight_names,
+        high_precision_substrings=expanded_high_precision,
+        quantized_companion_suffixes=(SOURCE_FP8_SCALE_KEY_SUFFIX,),
+    )
+    concrete_atomic_modules = tuple(
+        substring
+        for substring in expanded_high_precision
+        if substring not in configured_high_precision
+    )
+    quantization_cfg["modules_to_not_convert"] = list(
+        dict.fromkeys((*user_modules, *checkpoint_modules, *concrete_atomic_modules))
+    )
+
+
 def _quantization_fingerprint(quantization_cfg: dict[str, Any]) -> str:
     relevant_keys = (
         "extra_high_precision_layers_hf",
         "modules_to_not_convert",
         "num_layers_at_start_in_bf16",
         "num_layers_at_end_in_bf16",
+        # Legacy fingerprint inputs. No longer settable via
+        # SglangQuantizationConfig; kept so existing cache dirs stay valid.
         "weight_block_size",
         "scale_fmt",
     )
@@ -391,24 +542,20 @@ def ensure_mxfp8_checkpoint(
     model_path: str,
     quantization_cfg: dict[str, Any],
 ) -> str:
-    """Return a path to an MXFP8-loadable HF checkpoint for SGLang.
-
-    - If ``model_path`` is already an MXFP8 checkpoint, return it as-is.
-    - If ``quantization_cfg.converted_model_path`` is an MXFP8 checkpoint,
-      return it.
-    - Otherwise convert ``model_path`` into a hash-qualified subdirectory
-      under ``quantization_cfg.cache_root`` (or ``$NRL_MXFP8_CACHE`` /
-      ``~/.cache/nemo_rl/mxfp8`` if not set) and return that path.
-
-    The hash includes absolute model path, source config fingerprint,
-    quantization config fingerprint and converter version, so different
-    sources / settings never collide.
-    """
+    """Return an MXFP8 checkpoint path and synchronize its ignore policy."""
     if is_existing_mxfp8_checkpoint(model_path):
+        _merge_checkpoint_modules_to_not_convert(
+            checkpoint_path=model_path,
+            quantization_cfg=quantization_cfg,
+        )
         return model_path
 
     converted = quantization_cfg.get("converted_model_path")
     if converted and is_existing_mxfp8_checkpoint(converted):
+        _merge_checkpoint_modules_to_not_convert(
+            checkpoint_path=converted,
+            quantization_cfg=quantization_cfg,
+        )
         return converted
 
     cache_root = (
@@ -423,23 +570,33 @@ def ensure_mxfp8_checkpoint(
     )
 
     if is_existing_mxfp8_checkpoint(save_dir):
+        _merge_checkpoint_modules_to_not_convert(
+            checkpoint_path=save_dir,
+            quantization_cfg=quantization_cfg,
+        )
         return save_dir
 
-    extra_high_precision_layers_hf = tuple(
-        quantization_cfg.get("extra_high_precision_layers_hf", ()) or ()
+    source_cfg = _read_source_config(model_path)
+    num_hidden_layers = _get_num_hidden_layers(
+        source_cfg,
+        config_path=os.path.join(model_path, "config.json"),
     )
-    num_layers_at_start_in_bf16 = int(
-        quantization_cfg.get("num_layers_at_start_in_bf16", 0) or 0
-    )
-    num_layers_at_end_in_bf16 = int(
-        quantization_cfg.get("num_layers_at_end_in_bf16", 0) or 0
+    (
+        extra_high_precision_layers_hf,
+        modules_to_not_convert,
+        num_layers_at_start_in_bf16,
+        num_layers_at_end_in_bf16,
+    ) = _validated_conversion_options(
+        quantization_cfg,
+        num_hidden_layers=num_hidden_layers,
     )
 
     logger.info(
         f"[mxfp8] Converting {model_path} -> {save_dir} "
         f"(start_bf16={num_layers_at_start_in_bf16}, "
         f"end_bf16={num_layers_at_end_in_bf16}, "
-        f"extra_hp={extra_high_precision_layers_hf})"
+        f"extra_hp={extra_high_precision_layers_hf}, "
+        f"modules_to_not_convert={modules_to_not_convert})"
     )
     convert_mxfp8(
         model_dir=model_path,
@@ -447,5 +604,10 @@ def ensure_mxfp8_checkpoint(
         num_layers_at_start_in_bf16=num_layers_at_start_in_bf16,
         num_layers_at_end_in_bf16=num_layers_at_end_in_bf16,
         extra_high_precision_layers_hf=extra_high_precision_layers_hf,
+        modules_to_not_convert=modules_to_not_convert,
+    )
+    _merge_checkpoint_modules_to_not_convert(
+        checkpoint_path=save_dir,
+        quantization_cfg=quantization_cfg,
     )
     return save_dir

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -21,15 +21,18 @@ class SglangQuantizationConfig(TypedDict, total=False):
     """SGLang weight-precision config.
 
     ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. Set
-    ``scheme="mxfp8"`` to boot SGLang from an MXFP8 HF checkpoint and to send
-    MXFP8 HF tensors during online refit.
+    ``scheme="mxfp8"`` or ``scheme="nvfp4"`` to boot SGLang from the
+    corresponding quantized HF checkpoint and quantize HF tensors during
+    online refit. High-precision exclusions are shared by offline conversion
+    and online refit.
     """
 
-    scheme: str  # "bf16" | "mxfp8"
-    weight_block_size: list[int]
-    scale_fmt: str
+    scheme: Literal["bf16", "mxfp8", "nvfp4"]
+    # HF module-name substrings that the checkpoint loader and refit both skip.
     modules_to_not_convert: list[str]
+    # Additional HF weight-name substrings to keep in high precision.
     extra_high_precision_layers_hf: list[str]
+    # Number of decoder layers at each edge to keep in high precision.
     num_layers_at_start_in_bf16: int
     num_layers_at_end_in_bf16: int
     converted_model_path: str
@@ -97,7 +100,7 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
-    # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
+    # Weight precision and quantized-checkpoint conversion/refit knobs.
     quantization: NotRequired[SglangQuantizationConfig]
     sglang_router_config: SGLangRouterConfig
 

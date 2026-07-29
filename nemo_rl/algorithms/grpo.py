@@ -1266,22 +1266,33 @@ def setup(
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
-        # If MXFP8 is requested, ensure SGLang boots from an MXFP8 HF
-        # checkpoint. This must happen before ``init_sglang`` so the engine
-        # loads quantized weights.
+        # Quantized online refit requires SGLang to boot from a checkpoint
+        # with the exact same tensor layout and high-precision exclusions.
+        # Resolve it before ``init_sglang`` starts the engines.
         sglang_quantization_cfg = (
             generation_config["sglang_cfg"].get("quantization") or {}
         )
-        if sglang_quantization_cfg.get("scheme", "bf16") == "mxfp8":
-            from nemo_rl.models.generation.sglang.mxfp8_setup import (
-                ensure_mxfp8_checkpoint,
-            )
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            ensure_sglang_quantized_checkpoint,
+            get_sglang_quantization_scheme,
+            validate_sglang_quantized_refit_backend,
+        )
 
-            mxfp8_path = ensure_mxfp8_checkpoint(
+        sglang_quantization_scheme = get_sglang_quantization_scheme(
+            sglang_quantization_cfg
+        )
+        validate_sglang_quantized_refit_backend(
+            scheme=sglang_quantization_scheme,
+            use_megatron=bool(
+                policy_config.get("megatron_cfg", {}).get("enabled", False)
+            ),
+        )
+        generation_config["sglang_cfg"]["model_path"] = (
+            ensure_sglang_quantized_checkpoint(
                 model_path=generation_config["sglang_cfg"]["model_path"],
-                quantization_cfg=sglang_quantization_cfg,
+                quantization_config=sglang_quantization_cfg,
             )
-            generation_config["sglang_cfg"]["model_path"] = mxfp8_path
+        )
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,

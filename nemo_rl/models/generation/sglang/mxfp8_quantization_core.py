@@ -113,21 +113,16 @@ def should_quantize(
 def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(qweight, scale)`` in the SGLang MXFP8 layout.
 
-    Uses flashinfer's swizzle-free MXFP8 kernel (``flashinfer.mxfp8_quantize``
-    with ``is_sf_swizzled_layout=False``). flashinfer is a hard requirement
-    here — both the SGLang and Megatron actor environments pin it via
-    ``pyproject.toml``'s global ``flashinfer-python==0.6.4`` constraint, so a
-    missing import means the env was built incorrectly.
+    Uses flashinfer's swizzle-free MXFP8 kernel
+    (``is_sf_swizzled_layout=False``).
     """
     try:
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
     except ImportError as e:
         raise ImportError(
             "flashinfer is required for MXFP8 weight quantization but is not "
-            "installed in the current actor environment. Install "
-            "`flashinfer-python==0.6.4` (and `flashinfer-cubin==0.6.4`); "
-            "in NeMo-RL this is normally provided by the `mcore` or `sglang` "
-            "extras (see pyproject.toml constraint-dependencies)."
+            "installed in the current actor environment. In NeMo-RL this is "
+            "normally provided by the pinned `mcore` or `sglang` extras."
         ) from e
 
     weight = weight.contiguous()
@@ -150,45 +145,3 @@ def source_fp8_to_mxfp8_scale_u8(
         SOURCE_FP8_BLOCK_SIZE[0], dim=-2
     ).repeat_interleave(SOURCE_FP8_BLOCK_SIZE[1] // TARGET_MXFP8_BLOCK_SIZE[1], dim=-1)
     return mxfp8_scale_u8[..., :n, : (k // TARGET_MXFP8_BLOCK_SIZE[1])].contiguous()
-
-
-def build_dynamic_skip_substrings(
-    *,
-    quantization_config: dict[str, Any],
-    num_hidden_layers: int,
-) -> tuple[str, ...]:
-    """Compute the dynamic skip substrings for one HF model.
-
-    Combines the static ``SKIP_WEIGHT_SUBSTRINGS`` list with the user-provided
-    ``extra_high_precision_layers_hf`` / ``modules_to_not_convert`` lists from
-    the quantization config, plus per-layer prefixes for the ``head`` / ``tail``
-    BF16-band layers.
-    """
-    extra_high_precision_layers_hf = tuple(
-        quantization_config.get("extra_high_precision_layers_hf", ()) or ()
-    )
-    modules_to_not_convert = tuple(
-        quantization_config.get("modules_to_not_convert", ()) or ()
-    )
-    num_layers_at_start_in_bf16 = int(
-        quantization_config.get("num_layers_at_start_in_bf16", 0) or 0
-    )
-    num_layers_at_end_in_bf16 = int(
-        quantization_config.get("num_layers_at_end_in_bf16", 0) or 0
-    )
-
-    head_end_idx = num_layers_at_start_in_bf16
-    tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16
-    dynamic_skip_layer_prefixes: set[str] = set()
-    dynamic_skip_layer_prefixes.update(
-        f"model.layers.{i}." for i in range(0, head_end_idx)
-    )
-    dynamic_skip_layer_prefixes.update(
-        f"model.layers.{i}." for i in range(tail_start_idx, num_hidden_layers)
-    )
-    return (
-        *SKIP_WEIGHT_SUBSTRINGS,
-        *extra_high_precision_layers_hf,
-        *modules_to_not_convert,
-        *sorted(dynamic_skip_layer_prefixes),
-    )
