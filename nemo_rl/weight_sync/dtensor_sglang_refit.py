@@ -58,12 +58,9 @@ def refit_sglang_colocated(
             "clear_updatable_num_new_engines did not zero num_new_engines"
         )
 
-    # Pause with the configured mode, but only invalidate the KV cache when
-    # the mode actually drops generation state. "in_place" leaves the engine
-    # paused without dropping its KV cache, so flushing would clobber the
-    # still-valid in-place state.
-    pause_mode = policy_generation.pause_generation_mode
-    policy_generation.pause_generation(mode=pause_mode)
+    # Pause with the configured mode, then flush: an IPC refit replaces every
+    # weight in place, so no cached KV entry survives it regardless of mode.
+    policy_generation.pause_generation(mode=policy_generation.pause_generation_mode)
     policy_generation.invalidate_kv_cache()
     try:
         futures = policy.update_weights_to_sglang_colocated(
